@@ -1,115 +1,234 @@
-import { Worker } from 'bullmq';
+import { Worker, Queue } from 'bullmq';
 import { getRedisClient, isRedisReady } from '../connections/redis.js';
 import { logger } from '../utils/logger.js';
 import { Event } from '../models/Event.js';
 import { Session } from '../models/Session.js';
 
 let worker = null;
+let eventQueue = null;
 
-// Initialize worker if Redis is available
+// Initialize worker and queue if Redis is available
 export const initializeWorker = () => {
-  if (isRedisReady() && !worker) {
-    worker = new Worker('tracking', async (job) => {
-      try {
-        const event = job.data;
-        
-        // Save event to database
-        const savedEvent = await Event.create(event);
+  try {
+    if (isRedisReady() && !worker) {
+      const redisConnection = getRedisClient();
 
-        // Update or create session
-        const session = await Session.findOneAndUpdate(
-          {
-            projectId: event.projectId,
-            sessionId: event.sessionId
+      // Initialize the Queue first
+      eventQueue = new Queue('tracking', {
+        connection: redisConnection,
+        defaultJobOptions: {
+          attempts: 3,
+          backoff: {
+            type: 'exponential',
+            delay: 2000,
           },
-          {
-            $set: {
-              lastEvent: event.type,
-              lastPage: event.type === 'pageview' ? event.url : undefined,
-              lastActivity: new Date(event.timestamp)
-            },
-            $inc: {
-              pageViews: event.type === 'pageview' ? 1 : 0,
-              clicks: event.type === 'click' ? 1 : 0,
-              scrolls: event.type === 'scroll' ? 1 : 0,
-              forms: event.type === 'form' ? 1 : 0,
-              routes: event.type === 'route' ? 1 : 0
-            },
-            $setOnInsert: {
-              startTime: new Date(event.timestamp),
-              user: event.user
-            }
-          },
-          {
-            upsert: true,
-            new: true
-          }
-        );
-
-        // Handle unload events
-        if (event.type === 'unload') {
-          await Session.findByIdAndUpdate(session._id, {
-            $set: {
-              endTime: new Date(event.timestamp),
-              duration: new Date(event.timestamp) - session.startTime
-            }
-          });
+          removeOnComplete: 10,
+          removeOnFail: 50,
         }
+      });
 
-        return {
-          eventId: savedEvent._id,
-          sessionId: session._id
-        };
-      } catch (error) {
-        logger.error(`Error processing job ${job.id}: ${error.message}`);
-        throw error;
-      }
-    }, {
-      connection: getRedisClient(),
-      concurrency: 3,
-      limiter: {
-        max: 50,
-        duration: 1000
-      }
-    });
+      // Initialize the Worker
+      worker = new Worker('tracking', async (job) => {
+        try {
+          const eventData = job.data;
+          logger.info(`Processing job ${job.id} with event type: ${eventData.type}`);
 
-    // Handle worker events
-    worker.on('completed', (job) => {
-      logger.info(`Job ${job.id} completed successfully`);
-    });
+          // Save event to database
+          const savedEvent = await Event.create(eventData);
+          logger.info(`Event saved with ID: ${savedEvent._id}`);
 
-    worker.on('failed', (job, error) => {
-      logger.error(`Job ${job.id} failed: ${error.message}`);
-    });
+          // Update session data
+          const session = await updateSessionData(eventData, savedEvent._id);
+          logger.info(`Session updated: ${session._id}`);
 
-    worker.on('error', (error) => {
-      logger.error(`Worker error: ${error.message}`);
-    });
+          return {
+            eventId: savedEvent._id,
+            sessionId: session._id
+          };
+        } catch (error) {
+          logger.error(`Error processing job ${job.id}: ${error.message}`);
+          logger.error(`Job data:`, job.data);
+          throw error;
+        }
+      }, {
+        connection: redisConnection,
+        concurrency: 5,
+        limiter: {
+          max: 50,
+          duration: 1000
+        }
+      });
 
-    logger.info('Worker initialized successfully');
+      // Handle worker events
+      worker.on('completed', (job, result) => {
+        logger.info(`Job ${job.id} completed successfully`);
+      });
+
+      worker.on('failed', (job, error) => {
+        logger.error(`Job ${job.id} failed: ${error.message}`);
+      });
+
+      worker.on('error', (error) => {
+        logger.error(`Worker error: ${error.message}`);
+      });
+
+      worker.on('ready', () => {
+        logger.info('Worker is ready and waiting for jobs');
+      });
+
+      logger.info('Worker and Queue initialized successfully');
+      return true;
+    } else if (!isRedisReady()) {
+      logger.warn('Redis not ready, worker initialization skipped');
+      return false;
+    }
+  } catch (error) {
+    logger.error(`Error initializing worker: ${error.message}`);
+    return false;
   }
-  return worker;
+  return !!worker;
 };
 
-// Add event to queue
-export const addEvent = async (event) => {
+// Helper function to update session data (moved from trackingController)
+async function updateSessionData(eventData, eventId) {
   try {
-    if (isRedisReady() && worker) {
-      await worker.add('process-event', event);
-      return true;
+    const updateData = {
+      $set: {
+        lastActivity: eventData.timestamp,
+        lastEvent: eventData.type
+      },
+      $inc: {},
+      $setOnInsert: {
+        startTime: eventData.timestamp,
+        user: eventData.user,
+        isBounce: true
+      }
+    };
+
+    // Increment counters based on event type
+    switch (eventData.type) {
+      case 'pageview':
+        updateData.$inc.pageViews = 1;
+        updateData.$set.lastPage = {
+          url: eventData.page?.url,
+          title: eventData.page?.title
+        };
+        // If this is not the first pageview, it's not a bounce
+        updateData.$set.isBounce = false;
+        break;
+      case 'click':
+        updateData.$inc['events.clicks'] = 1;
+        updateData.$set.isBounce = false;
+        break;
+      case 'scroll':
+        updateData.$inc['events.scrolls'] = 1;
+        break;
+      case 'form':
+        updateData.$inc['events.forms'] = 1;
+        updateData.$set.isBounce = false;
+        break;
+      case 'route':
+        updateData.$inc['events.routes'] = 1;
+        break;
+      case 'unload':
+        updateData.$set.endTime = eventData.timestamp;
+        break;
     }
-    logger.warn('Worker not available, event processing may be delayed');
-    return false;
+
+    // Set first page data only on insert
+    if (eventData.type === 'pageview' && eventData.page) {
+      updateData.$setOnInsert.firstPage = {
+        url: eventData.page.url,
+        title: eventData.page.title,
+        referrer: eventData.page.referrer
+      };
+    }
+
+    const session = await Session.findOneAndUpdate(
+      {
+        projectId: eventData.projectId,
+        sessionId: eventData.sessionId
+      },
+      updateData,
+      {
+        upsert: true,
+        new: true
+      }
+    );
+
+    // Calculate session duration for unload events
+    if (eventData.type === 'unload' && session.startTime) {
+      const duration = eventData.timestamp - session.startTime;
+      await Session.findByIdAndUpdate(session._id, {
+        $set: { duration: Math.max(0, duration) }
+      });
+    }
+
+    return session;
+
+  } catch (error) {
+    logger.error('Error updating session data:', error.message);
+    throw error;
+  }
+}
+
+// Add event to queue with fallback
+export const addEvent = async (eventData) => {
+  try {
+    if (isRedisReady() && eventQueue) {
+      const job = await eventQueue.add('process-event', eventData, {
+        priority: eventData.type === 'pageview' ? 10 : 5,
+        delay: 0
+      });
+      logger.info(`Event queued with job ID: ${job.id}`);
+      return true;
+    } else {
+      logger.warn('Event queue not available, will process directly');
+      return false;
+    }
   } catch (error) {
     logger.error(`Error adding event to queue: ${error.message}`);
     return false;
   }
 };
 
-// Close worker
-export const closeWorker = async () => {
-  if (worker) {
-    await worker.close();
-    worker = null;
+// Get queue stats
+export const getQueueStats = async () => {
+  try {
+    if (eventQueue) {
+      const waiting = await eventQueue.getWaiting();
+      const active = await eventQueue.getActive();
+      const completed = await eventQueue.getCompleted();
+      const failed = await eventQueue.getFailed();
+
+      return {
+        waiting: waiting.length,
+        active: active.length,
+        completed: completed.length,
+        failed: failed.length
+      };
+    }
+    return null;
+  } catch (error) {
+    logger.error(`Error getting queue stats: ${error.message}`);
+    return null;
   }
-}; 
+};
+
+// Close worker and queue
+export const closeWorker = async () => {
+  try {
+    if (worker) {
+      await worker.close();
+      worker = null;
+      logger.info('Worker closed');
+    }
+    if (eventQueue) {
+      await eventQueue.close();
+      eventQueue = null;
+      logger.info('Queue closed');
+    }
+  } catch (error) {
+    logger.error(`Error closing worker/queue: ${error.message}`);
+  }
+};

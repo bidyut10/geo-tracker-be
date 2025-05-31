@@ -33,7 +33,7 @@ export const createProject = async (req, res) => {
         name: project.name,
         domain: project.domain,
         trackingId: project.trackingId,
-        trackingScript: `<script src="https://tracker-domain.com/api/track/t.js?pid=${project.trackingId}"></script>`
+        trackingScript: `<script src="https://tracker-domain.com/api/track/t.js?pid=${project.trackingId}&v=1"></script>`
       }
     });
   } catch (error) {
@@ -52,7 +52,7 @@ export const getProjects = async (req, res) => {
       name: project.name,
       domain: project.domain,
       trackingId: project.trackingId,
-      trackingScript: `<script src="https://tracker-domain.com/api/track/t.js?pid=${project.trackingId}"></script>`,
+      trackingScript: `<script src="https://tracker-domain.com/api/track/t.js?pid=${project.trackingId}&v=1"></script>`,
       isActive: project.isActive,
       createdAt: project.createdAt
     }));
@@ -81,7 +81,7 @@ export const getProject = async (req, res) => {
       name: project.name,
       domain: project.domain,
       trackingId: project.trackingId,
-      trackingScript: `<script src="https://tracker-domain.com/api/track/t.js?pid=${project.trackingId}"></script>`,
+      trackingScript: `<script src="https://tracker-domain.com/api/track/t.js?pid=${project.trackingId}&v=1"></script>`,
       settings: project.settings,
       isActive: project.isActive,
       createdAt: project.createdAt
