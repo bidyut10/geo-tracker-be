@@ -2,7 +2,7 @@ import { Project } from '../models/Project.js';
 import { parseUserAgent } from '../utils/deviceParser.js';
 import { getGeoInfo } from '../utils/geoLookup.js';
 import { logger } from '../utils/logger.js';
-import { addEvent } from '../worker/index.js';
+import { addEvent } from '../worker/worker.js';
 
 //Process tracking events from client
 export const processEvents = async (req, res) => {
@@ -87,8 +87,25 @@ export const processEvents = async (req, res) => {
 };
 
 //Serve tracking script to client
-export const serveTrackingScript = (req, res) => {
+export const serveTrackingScript = async (req, res) => {
   try {
+    const { pid } = req.query;
+
+    // Validate project ID
+    if (!pid) {
+      return res.status(400).json({ error: 'Project ID is required' });
+    }
+
+    // Verify project exists and is active
+    const project = await Project.findOne({
+      trackingId: pid,
+      isActive: true
+    });
+
+    if (!project) {
+      return res.status(404).json({ error: 'Invalid or inactive project ID' });
+    }
+
     // Set appropriate headers
     res.setHeader('Content-Type', 'application/javascript');
     res.setHeader('Cache-Control', 'public, max-age=3600');
@@ -97,7 +114,7 @@ export const serveTrackingScript = (req, res) => {
     res.setHeader('X-XSS-Protection', '1; mode=block');
 
     // Send the tracking script
-    res.sendFile('t.js', { root: './public' });
+    res.sendFile('tracker.js', { root: './public' });
   } catch (error) {
     logger.error(`Error serving tracking script: ${error.message}`);
     res.status(500).json({ error: 'Failed to serve tracking script' });

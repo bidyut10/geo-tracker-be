@@ -10,6 +10,8 @@ import { logger } from './utils/logger.js';
 import authRoutes from './routes/auth.js';
 import trackingRoutes from './routes/tracking.js';
 import dataRoutes from './routes/data.js';
+import projectRoutes from './routes/project.js';
+import { initializeWorker, closeWorker } from './worker/worker.js';
 
 const app = express();
 
@@ -52,6 +54,7 @@ app.use('/public', express.static('public', {
 app.use('/api/auth', authRoutes);
 app.use('/api/track', trackingRoutes);
 app.use('/api/data', dataRoutes);
+app.use('/api/projects', projectRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -71,6 +74,9 @@ async function startServer() {
     await connectDB();
     await connectRedis();
 
+    // Initialize worker
+    initializeWorker();
+
     // Get port from environment or use default
     const PORT = process.env.PORT || 3000;
 
@@ -83,6 +89,17 @@ async function startServer() {
     process.exit(1);
   }
 }
+
+// Handle process termination
+process.on('SIGTERM', async () => {
+  await closeWorker();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  await closeWorker();
+  process.exit(0);
+});
 
 // Start the server
 startServer();
